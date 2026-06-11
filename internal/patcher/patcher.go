@@ -1,7 +1,6 @@
 package patcher
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,68 +8,92 @@ import (
 	"strings"
 
 	"github.com/barelyhuman/auditor/internal/audit"
+	"github.com/barelyhuman/auditor/internal/lockfile"
 	"github.com/barelyhuman/auditor/internal/registry"
+	"github.com/tidwall/sjson"
 )
 
 type PatchResult struct {
-	PackageName        string
-	OldVersion         string
-	NewVersion         string
-	PatchedKeys        []string
-	PackageJSONUpdated bool
-	Err                error
+	PackageName      string
+	OldVersion       string
+	NewVersion       string
+	PatchedKeys      []string
+	PackageJSONPaths []string // package.json files updated (root + workspace members)
+	Err              error
 }
 
-// PatchPackages updates package-lock.json (and package.json for direct deps)
-// for each selected vulnerability. Uses surgical JSON map manipulation to
-// preserve all unrelated fields.
+// PatchPackages updates package-lock.json and all relevant package.json files.
+// Uses sjson for surgical in-place writes — preserves key order and formatting.
 func PatchPackages(dir string, vulns []audit.SafeVuln, dryRun bool) ([]PatchResult, error) {
 	lockPath := filepath.Join(dir, "package-lock.json")
-	pkgPath := filepath.Join(dir, "package.json")
 
-	// Read lockfile as raw JSON to preserve unknown fields
-	lockRaw, err := readRawLock(lockPath)
-	if err != nil {
-		return nil, err
+	workspaceDirs, _ := lockfile.WorkspaceMemberDirs(lockPath)
+
+	allPkgPaths := []string{filepath.Join(dir, "package.json")}
+	for _, wsDir := range workspaceDirs {
+		allPkgPaths = append(allPkgPaths, filepath.Join(dir, wsDir, "package.json"))
 	}
 
-	pkgRaw, err := readRawPkg(pkgPath)
-	if err != nil {
-		return nil, err
+	// Deduplicate: multiple CVEs for same name@version → keep max FixedVersion.
+	// Without this, a lower-FixedVersion CVE processed last would overwrite package.json
+	// with a still-vulnerable version while the lockfile already has the correct higher version.
+	bestFix := make(map[string]audit.SafeVuln) // key = "name@version"
+	for _, v := range vulns {
+		key := v.PackageName + "@" + v.Version
+		if existing, ok := bestFix[key]; !ok || registry.SemverLess(existing.FixedVersion, v.FixedVersion) {
+			bestFix[key] = v
+		}
 	}
-
-	// Extract "packages" map (v2/v3) — each entry is itself a raw field map
-	packagesRaw, hasPackages, err := extractPackagesMap(lockRaw)
-	if err != nil {
-		return nil, err
+	deduped := make([]audit.SafeVuln, 0, len(bestFix))
+	for _, v := range bestFix {
+		deduped = append(deduped, v)
 	}
 
 	var results []PatchResult
 
-	for _, v := range vulns {
+	for _, v := range deduped {
 		res := PatchResult{
 			PackageName: v.PackageName,
 			OldVersion:  v.Version,
 			NewVersion:  v.FixedVersion,
 		}
 
-		// Fetch registry metadata for the fixed version
-		dist, err := registry.FetchDist(v.PackageName, v.FixedVersion)
+		// Resolve minimum published version >= OSV's fixed, within same major as installed.
+		safeVer, err := registry.MinSafeVersion(v.PackageName, v.Version, v.FixedVersion)
+		if err != nil {
+			res.Err = fmt.Errorf("no safe version for %s: %w", v.PackageName, err)
+			results = append(results, res)
+			continue
+		}
+		dist, err := registry.FetchDist(v.PackageName, safeVer)
 		if err != nil {
 			res.Err = err
 			results = append(results, res)
 			continue
 		}
+		res.NewVersion = dist.Version
 
-		if hasPackages {
-			patched := patchPackagesMap(packagesRaw, v.PackageName, v.Version, dist)
-			res.PatchedKeys = patched
+		// Patch lockfile
+		patched, err := patchLockfileInPlace(lockPath, v.PackageName, v.Version, dist, dryRun)
+		if err != nil {
+			res.Err = err
+			results = append(results, res)
+			continue
 		}
+		res.PatchedKeys = patched
 
-		// Update package.json if direct dep
+		// Patch package.json files for direct deps
 		if v.IsDirect {
-			updated := updatePackageJSON(pkgRaw, v.PackageName, v.FixedVersion, v.Dev)
-			res.PackageJSONUpdated = updated
+			for _, pkgPath := range allPkgPaths {
+				updated, err := updatePkgFileInPlace(pkgPath, v.PackageName, dist.Version, dryRun)
+				if err != nil {
+					// Non-fatal: file may not exist (workspace member without this dep)
+					continue
+				}
+				if updated {
+					res.PackageJSONPaths = append(res.PackageJSONPaths, pkgPath)
+				}
+			}
 		}
 
 		results = append(results, res)
@@ -78,94 +101,103 @@ func PatchPackages(dir string, vulns []audit.SafeVuln, dryRun bool) ([]PatchResu
 
 	if dryRun {
 		printDryRun(results)
-		return results, nil
 	}
-
-	// Write lockfile back
-	if hasPackages {
-		if err := writeLock(lockPath, lockRaw, packagesRaw); err != nil {
-			return nil, fmt.Errorf("write package-lock.json: %w", err)
-		}
-	}
-
-	// Write package.json back if modified
-	anyDirect := false
-	for _, r := range results {
-		if r.PackageJSONUpdated {
-			anyDirect = true
-			break
-		}
-	}
-	if anyDirect {
-		if err := writePkg(pkgPath, pkgRaw); err != nil {
-			return nil, fmt.Errorf("write package.json: %w", err)
-		}
-	}
-
 	return results, nil
 }
 
-// patchPackagesMap updates all lockfile entries for pkgName@oldVersion in-place.
-// Returns list of keys that were patched.
-func patchPackagesMap(packages map[string]map[string]json.RawMessage, pkgName, oldVersion string, dist *registry.DistInfo) []string {
+// patchLockfileInPlace surgically updates version/resolved/integrity for matching entries.
+// Uses sjson to preserve key order and formatting.
+func patchLockfileInPlace(lockPath, pkgName, oldVersion string, dist *registry.DistInfo, dryRun bool) ([]string, error) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("read package-lock.json: %w", err)
+	}
+
+	// Partial unmarshal to find matching keys (read-only)
+	var lock struct {
+		Packages map[string]struct {
+			Version string `json:"version"`
+		} `json:"packages"`
+	}
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return nil, fmt.Errorf("parse package-lock.json: %w", err)
+	}
+
 	suffix := "node_modules/" + pkgName
 	var patched []string
 
-	for key, entry := range packages {
-		if !strings.HasSuffix(key, suffix) {
+	for key, entry := range lock.Packages {
+		if !strings.HasSuffix(key, suffix) || entry.Version != oldVersion {
 			continue
 		}
-
-		// Only patch entries at the vulnerable version
-		var entryVersion string
-		if raw, ok := entry["version"]; ok {
-			_ = json.Unmarshal(raw, &entryVersion)
-		}
-		if entryVersion != oldVersion {
-			continue
-		}
-
-		entry["version"] = mustMarshal(dist.Version)
-		entry["resolved"] = mustMarshal(dist.Tarball)
-		entry["integrity"] = mustMarshal(dist.Integrity)
-		packages[key] = entry
+		base := "packages." + key
+		data, _ = sjson.SetBytes(data, base+".version", dist.Version)
+		data, _ = sjson.SetBytes(data, base+".resolved", dist.Tarball)
+		data, _ = sjson.SetBytes(data, base+".integrity", dist.Integrity)
 		patched = append(patched, key)
 	}
 
-	return patched
+	if len(patched) > 0 && !dryRun {
+		if err := os.WriteFile(lockPath, data, 0644); err != nil {
+			return nil, fmt.Errorf("write package-lock.json: %w", err)
+		}
+	}
+	return patched, nil
 }
 
-// updatePackageJSON bumps the version range in dependencies or devDependencies.
-func updatePackageJSON(pkg map[string]json.RawMessage, name, fixedVersion string, _ bool) bool {
-	sections := []string{"dependencies", "devDependencies"}
-	for _, section := range sections {
-		raw, ok := pkg[section]
-		if !ok {
-			continue
-		}
-		var deps map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &deps); err != nil {
-			continue
-		}
-		existing, ok := deps[name]
-		if !ok {
-			continue
-		}
-
-		var current string
-		_ = json.Unmarshal(existing, &current)
-
-		// Preserve range prefix (^, ~, >=, exact)
-		prefix := rangePrefix(current)
-		deps[name] = mustMarshal(prefix + fixedVersion)
-
-		updated, err := json.Marshal(deps)
-		if err == nil {
-			pkg[section] = updated
-		}
-		return true
+// updatePkgFileInPlace surgically bumps one dependency version in a package.json.
+// Preserves key order, whitespace, and all other fields.
+func updatePkgFileInPlace(path, name, fixedVersion string, dryRun bool) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil // file doesn't exist — skip silently
 	}
-	return false
+
+	// Partial unmarshal to detect section and current version prefix
+	var pkg struct {
+		Dependencies         map[string]string `json:"dependencies"`
+		DevDependencies      map[string]string `json:"devDependencies"`
+		PeerDependencies     map[string]string `json:"peerDependencies"`
+		OptionalDependencies map[string]string `json:"optionalDependencies"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return false, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	sections := []struct {
+		key  string
+		deps map[string]string
+	}{
+		{"dependencies", pkg.Dependencies},
+		{"devDependencies", pkg.DevDependencies},
+		{"peerDependencies", pkg.PeerDependencies},
+		{"optionalDependencies", pkg.OptionalDependencies},
+	}
+
+	var sectionPath string
+	var prefix string
+	for _, s := range sections {
+		if current, ok := s.deps[name]; ok {
+			sectionPath = s.key + "." + name
+			prefix = rangePrefix(current)
+			break
+		}
+	}
+	if sectionPath == "" {
+		return false, nil // not in this file
+	}
+
+	updated, err := sjson.SetBytes(data, sectionPath, prefix+fixedVersion)
+	if err != nil {
+		return false, fmt.Errorf("sjson set %s in %s: %w", sectionPath, path, err)
+	}
+
+	if !dryRun {
+		if err := os.WriteFile(path, updated, 0644); err != nil {
+			return false, fmt.Errorf("write %s: %w", path, err)
+		}
+	}
+	return true, nil
 }
 
 func rangePrefix(version string) string {
@@ -177,95 +209,6 @@ func rangePrefix(version string) string {
 	return ""
 }
 
-// --- JSON helpers ---
-
-func readRawLock(path string) (map[string]json.RawMessage, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read package-lock.json: %w", err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse package-lock.json: %w", err)
-	}
-	return raw, nil
-}
-
-func readRawPkg(path string) (map[string]json.RawMessage, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read package.json: %w", err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse package.json: %w", err)
-	}
-	return raw, nil
-}
-
-func extractPackagesMap(lock map[string]json.RawMessage) (map[string]map[string]json.RawMessage, bool, error) {
-	packagesJSON, ok := lock["packages"]
-	if !ok {
-		return nil, false, nil
-	}
-	var raw map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(packagesJSON, &raw); err != nil {
-		return nil, false, fmt.Errorf("parse packages map: %w", err)
-	}
-	return raw, true, nil
-}
-
-func writeLock(path string, lock map[string]json.RawMessage, packages map[string]map[string]json.RawMessage) error {
-	pkgJSON, err := marshalNoEscape(packages)
-	if err != nil {
-		return err
-	}
-	lock["packages"] = pkgJSON
-	out, err := marshalIndentNoEscape(lock)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(out, '\n'), 0644)
-}
-
-func writePkg(path string, pkg map[string]json.RawMessage) error {
-	out, err := marshalIndentNoEscape(pkg)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(out, '\n'), 0644)
-}
-
-func mustMarshal(v string) json.RawMessage {
-	b, err := marshalNoEscape(v)
-	if err != nil {
-		b, _ = json.Marshal(v)
-	}
-	return b
-}
-
-func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	// Encode appends a trailing newline; trim it
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
-
-func marshalIndentNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
-
 func printDryRun(results []PatchResult) {
 	fmt.Println("\n[dry-run] Changes that would be applied:")
 	for _, r := range results {
@@ -275,10 +218,10 @@ func printDryRun(results []PatchResult) {
 		}
 		fmt.Printf("  %s: %s → %s\n", r.PackageName, r.OldVersion, r.NewVersion)
 		for _, k := range r.PatchedKeys {
-			fmt.Printf("      lockfile key: %s\n", k)
+			fmt.Printf("      lockfile: %s\n", k)
 		}
-		if r.PackageJSONUpdated {
-			fmt.Printf("      package.json: updated\n")
+		for _, p := range r.PackageJSONPaths {
+			fmt.Printf("      package.json: %s\n", p)
 		}
 	}
 }
