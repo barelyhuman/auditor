@@ -9,6 +9,8 @@ import (
 	"github.com/barelyhuman/auditor/internal/lockfile"
 	"github.com/barelyhuman/auditor/internal/osv"
 	"github.com/barelyhuman/auditor/internal/output"
+	"github.com/barelyhuman/auditor/internal/patcher"
+	"github.com/barelyhuman/auditor/internal/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -18,6 +20,8 @@ var (
 	flagPath       string
 	flagIncludeDev bool
 	flagNoColor    bool
+	flagFix        bool
+	flagDryRun     bool
 )
 
 var rootCmd = &cobra.Command{
@@ -44,6 +48,8 @@ func init() {
 	rootCmd.Flags().StringVar(&flagPath, "path", "", "path to Node.js project (default: current directory)")
 	rootCmd.Flags().BoolVar(&flagIncludeDev, "include-dev", false, "include dev dependencies")
 	rootCmd.Flags().BoolVar(&flagNoColor, "no-color", false, "disable color output")
+	rootCmd.Flags().BoolVar(&flagFix, "fix", false, "interactively select and patch safe-fixable vulnerabilities")
+	rootCmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "show what --fix would change without writing files")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -81,8 +87,56 @@ func run(cmd *cobra.Command, args []string) error {
 		output.RenderTable(vulns, flagNoColor)
 	}
 
-	os.Exit(1)
+	if !flagFix && !flagDryRun {
+		os.Exit(1)
+	}
+
+	// Interactive selection
+	selected, err := tui.SelectPackages(vulns)
+	if err != nil {
+		return fmt.Errorf("selection cancelled: %w", err)
+	}
+	if len(selected) == 0 {
+		fmt.Println("No packages selected.")
+		os.Exit(0)
+	}
+
+	results, err := patcher.PatchPackages(projectDir, selected, flagDryRun)
+	if err != nil {
+		return err
+	}
+
+	if !flagDryRun {
+		printPatchSummary(results)
+		fmt.Println("\nRun `npm install` to update node_modules.")
+	}
+
 	return nil
+}
+
+func printPatchSummary(results []patcher.PatchResult) {
+	fmt.Println("\nPatch summary:")
+	for _, r := range results {
+		if r.Err != nil {
+			fmt.Printf("  ✗ %s: %v\n", r.PackageName, r.Err)
+			continue
+		}
+		keys := len(r.PatchedKeys)
+		pkgJSON := ""
+		if r.PackageJSONUpdated {
+			pkgJSON = " + package.json"
+		}
+		fmt.Printf("  ✓ %s  %s → %s  (%d lockfile %s%s)\n",
+			r.PackageName, r.OldVersion, r.NewVersion,
+			keys, plural(keys, "entry", "entries"), pkgJSON)
+	}
+}
+
+func plural(n int, singular, pluralForm string) string {
+	if n == 1 {
+		return singular
+	}
+	return pluralForm
 }
 
 func resolveDir(args []string) string {

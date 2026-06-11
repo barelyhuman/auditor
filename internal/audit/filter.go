@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -115,29 +116,176 @@ func majorOf(version string) int {
 }
 
 // extractSeverity derives severity string and CVSS score from the vuln.
+// Priority: database_specific.severity string → CVSS vector computation.
 func extractSeverity(v osv.Vulnerability) (string, float64) {
+	// GitHub/NVD advisory data often provides a pre-computed severity string.
+	if raw, ok := v.DatabaseSpecific["severity"]; ok {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+			return normalizeSeverity(s), 0
+		}
+	}
+	// Fall back: compute base score from CVSS vector string.
 	for _, s := range v.Severity {
 		if s.Type == "CVSS_V3" || s.Type == "CVSS_V2" {
-			score := parseCVSSScore(s.Score)
-			return scoreToSeverity(score), score
+			score := cvssBaseScore(s.Score)
+			if score > 0 {
+				return scoreToSeverity(score), score
+			}
 		}
 	}
 	return "low", 0
 }
 
-func parseCVSSScore(score string) float64 {
-	// CVSS score is embedded in vector string like "CVSS:3.1/AV:N/.../E:3.7"
-	// or may be a bare float string
-	parts := strings.Split(score, "/")
-	// look for a standalone numeric score — sometimes it's the last segment or a dedicated field
-	// OSV severity score field is the vector string; actual numeric score often not provided
-	// Fall back: parse first part after "CVSS:3.x" prefix if it looks like a float
+func normalizeSeverity(s string) string {
+	switch strings.ToUpper(s) {
+	case "CRITICAL":
+		return "critical"
+	case "HIGH":
+		return "high"
+	case "MODERATE", "MEDIUM":
+		return "moderate"
+	default:
+		return "low"
+	}
+}
+
+// cvssBaseScore computes the CVSS 3.x base score from a vector string.
+// Vector format: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+func cvssBaseScore(vector string) float64 {
+	metrics := parseCVSSVector(vector)
+	if len(metrics) == 0 {
+		return 0
+	}
+
+	// Impact sub-score weights (CVSS 3.1 spec table 12)
+	c := impactWeight(metrics["C"])
+	i := impactWeight(metrics["I"])
+	a := impactWeight(metrics["A"])
+
+	iss := 1 - (1-c)*(1-i)*(1-a)
+
+	scope := metrics["S"]
+	var impact float64
+	if scope == "U" {
+		impact = 6.42 * iss
+	} else {
+		impact = 7.52*(iss-0.029) - 3.25*pow(iss-0.02, 15)
+	}
+
+	if impact <= 0 {
+		return 0
+	}
+
+	avW := avWeight(metrics["AV"])
+	acW := acWeight(metrics["AC"])
+	prW := prWeight(metrics["PR"], scope == "C")
+	uiW := uiWeight(metrics["UI"])
+
+	exploitability := 8.22 * avW * acW * prW * uiW
+
+	var base float64
+	if scope == "U" {
+		base = roundUp(min10(impact + exploitability))
+	} else {
+		base = roundUp(min10(1.08 * (impact + exploitability)))
+	}
+	return base
+}
+
+func parseCVSSVector(vector string) map[string]string {
+	metrics := make(map[string]string)
+	parts := strings.Split(vector, "/")
 	for _, p := range parts {
-		if f, err := strconv.ParseFloat(p, 64); err == nil && f >= 0 && f <= 10 {
-			return f
+		kv := strings.SplitN(p, ":", 2)
+		if len(kv) == 2 {
+			metrics[kv[0]] = kv[1]
 		}
 	}
+	return metrics
+}
+
+func impactWeight(v string) float64 {
+	switch v {
+	case "N":
+		return 0
+	case "L":
+		return 0.22
+	case "H":
+		return 0.56
+	}
 	return 0
+}
+
+func avWeight(v string) float64 {
+	switch v {
+	case "N":
+		return 0.85
+	case "A":
+		return 0.62
+	case "L":
+		return 0.55
+	case "P":
+		return 0.2
+	}
+	return 0.85
+}
+
+func acWeight(v string) float64 {
+	if v == "H" {
+		return 0.44
+	}
+	return 0.77
+}
+
+func prWeight(v string, scopeChanged bool) float64 {
+	if scopeChanged {
+		switch v {
+		case "N":
+			return 0.85
+		case "L":
+			return 0.68
+		case "H":
+			return 0.50
+		}
+	} else {
+		switch v {
+		case "N":
+			return 0.85
+		case "L":
+			return 0.62
+		case "H":
+			return 0.27
+		}
+	}
+	return 0.85
+}
+
+func uiWeight(v string) float64 {
+	if v == "R" {
+		return 0.62
+	}
+	return 0.85
+}
+
+func roundUp(x float64) float64 {
+	// Round up to 1 decimal place (CVSS 3.1 spec)
+	return float64(int(x*10+0.999999)) / 10
+}
+
+func min10(x float64) float64 {
+	if x > 10 {
+		return 10
+	}
+	return x
+}
+
+func pow(base, exp float64) float64 {
+	result := 1.0
+	for i := 0; i < int(exp); i++ {
+		result *= base
+	}
+	return result
 }
 
 func scoreToSeverity(score float64) string {
