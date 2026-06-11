@@ -15,13 +15,14 @@ import (
 )
 
 var (
-	flagSeverity   string
-	flagFormat     string
-	flagPath       string
-	flagIncludeDev bool
-	flagNoColor    bool
-	flagFix        bool
-	flagDryRun     bool
+	flagSeverity       string
+	flagFormat         string
+	flagPath           string
+	flagIncludeDev     bool
+	flagNoColor        bool
+	flagFix            bool
+	flagDryRun         bool
+	flagLegacyPeerDeps bool
 )
 
 var rootCmd = &cobra.Command{
@@ -50,6 +51,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&flagNoColor, "no-color", false, "disable color output")
 	rootCmd.Flags().BoolVar(&flagFix, "fix", false, "interactively select and patch safe-fixable vulnerabilities")
 	rootCmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "show what --fix would change without writing files")
+	rootCmd.Flags().BoolVar(&flagLegacyPeerDeps, "legacy-peer-deps", false, "use --legacy-peer-deps when running npm install after patching")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -108,7 +110,11 @@ func run(cmd *cobra.Command, args []string) error {
 
 	if !flagDryRun {
 		printPatchSummary(results)
-		fmt.Println("\nRun `npm install` to update node_modules.")
+		installCmd := "npm install"
+		if flagLegacyPeerDeps {
+			installCmd += " --legacy-peer-deps"
+		}
+		fmt.Printf("\nRun `%s` to update node_modules.\n", installCmd)
 	}
 
 	return nil
@@ -123,8 +129,8 @@ func printPatchSummary(results []patcher.PatchResult) {
 		}
 		keys := len(r.PatchedKeys)
 		pkgJSON := ""
-		if r.PackageJSONUpdated {
-			pkgJSON = " + package.json"
+		if len(r.PackageJSONPaths) > 0 {
+			pkgJSON = fmt.Sprintf(" + %d package.json", len(r.PackageJSONPaths))
 		}
 		fmt.Printf("  ✓ %s  %s → %s  (%d lockfile %s%s)\n",
 			r.PackageName, r.OldVersion, r.NewVersion,

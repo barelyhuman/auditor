@@ -27,18 +27,52 @@ func ReadPackages(dir string) ([]Package, error) {
 		return nil, fmt.Errorf("parse package-lock.json: %w", err)
 	}
 
-	directDeps := make(map[string]bool)
+	// Root direct deps (all declared dep sections)
+	rootDirect := make(map[string]bool)
 	for name := range pkgJSON.Dependencies {
-		directDeps[name] = true
+		rootDirect[name] = true
 	}
 	for name := range pkgJSON.DevDependencies {
-		directDeps[name] = true
+		rootDirect[name] = true
+	}
+	for name := range pkgJSON.PeerDependencies {
+		rootDirect[name] = true
+	}
+	for name := range pkgJSON.OptionalDependencies {
+		rootDirect[name] = true
+	}
+
+	// Workspace member direct deps: package name → workspace dir
+	workspaceDirect := make(map[string]string)
+	if lock.LockfileVersion >= 2 {
+		for key := range lock.Packages {
+			if key == "" || strings.HasPrefix(key, "node_modules/") {
+				continue
+			}
+			// key is a workspace member path like "packages/foo"
+			memberPkg, err := readPackageJSON(filepath.Join(dir, key))
+			if err != nil {
+				continue // member missing package.json — skip
+			}
+			for _, depMap := range []map[string]string{
+				memberPkg.Dependencies,
+				memberPkg.DevDependencies,
+				memberPkg.PeerDependencies,
+				memberPkg.OptionalDependencies,
+			} {
+				for name := range depMap {
+					if _, alreadyRoot := rootDirect[name]; !alreadyRoot {
+						workspaceDirect[name] = key
+					}
+				}
+			}
+		}
 	}
 
 	if lock.LockfileVersion >= 2 {
-		return parseV2(lock, directDeps), nil
+		return parseV2(lock, rootDirect, workspaceDirect), nil
 	}
-	return parseV1(lock, directDeps), nil
+	return parseV1(lock, rootDirect), nil
 }
 
 func readPackageJSON(dir string) (*PackageJSON, error) {
@@ -57,13 +91,13 @@ func readPackageJSON(dir string) (*PackageJSON, error) {
 }
 
 // parseV2 handles lockfileVersion 2 and 3 (packages map)
-func parseV2(lock PackageLock, directDeps map[string]bool) []Package {
+func parseV2(lock PackageLock, rootDirect map[string]bool, workspaceDirect map[string]string) []Package {
 	seen := make(map[string]bool)
 	var pkgs []Package
 
 	for key, lp := range lock.Packages {
-		if key == "" {
-			continue // root entry
+		if key == "" || !strings.HasPrefix(key, "node_modules/") {
+			continue // skip root and workspace member entries
 		}
 
 		name := nameFromKey(key)
@@ -72,11 +106,21 @@ func parseV2(lock PackageLock, directDeps map[string]bool) []Package {
 		}
 		seen[name+"|"+lp.Version] = true
 
+		isDirect := rootDirect[name]
+		workspaceDir := ""
+		if !isDirect {
+			if wsDir, ok := workspaceDirect[name]; ok {
+				isDirect = true
+				workspaceDir = wsDir
+			}
+		}
+
 		pkgs = append(pkgs, Package{
-			Name:     name,
-			Version:  lp.Version,
-			IsDirect: directDeps[name],
-			Dev:      lp.Dev || lp.Peer,
+			Name:         name,
+			Version:      lp.Version,
+			IsDirect:     isDirect,
+			Dev:          lp.Dev || lp.Peer,
+			WorkspaceDir: workspaceDir,
 		})
 	}
 	return pkgs
@@ -118,4 +162,24 @@ func nameFromKey(key string) string {
 		return ""
 	}
 	return key[idx+len(prefix):]
+}
+
+// WorkspaceMemberDirs returns all workspace member paths found in the lockfile packages map.
+// These are keys that are not "" and don't start with "node_modules/".
+func WorkspaceMemberDirs(lockPath string) ([]string, error) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return nil, err
+	}
+	var lock PackageLock
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for key := range lock.Packages {
+		if key != "" && !strings.HasPrefix(key, "node_modules/") {
+			dirs = append(dirs, key)
+		}
+	}
+	return dirs, nil
 }
