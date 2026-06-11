@@ -1,5 +1,7 @@
 package osv
 
+import "encoding/json"
+
 // QueryBatch request/response
 
 type BatchRequest struct {
@@ -33,11 +35,12 @@ type VulnRef struct {
 // Full vulnerability detail from GET /v1/vulns/{id}
 
 type Vulnerability struct {
-	ID       string   `json:"id"`
-	Aliases  []string `json:"aliases"`
-	Summary  string   `json:"summary"`
-	Severity []Severity `json:"severity"`
-	Affected []Affected `json:"affected"`
+	ID               string                     `json:"id"`
+	Aliases          []string                   `json:"aliases"`
+	Summary          string                     `json:"summary"`
+	Severity         []Severity                 `json:"severity"`
+	Affected         []Affected                 `json:"affected"`
+	DatabaseSpecific map[string]json.RawMessage `json:"database_specific"`
 }
 
 type Severity struct {
