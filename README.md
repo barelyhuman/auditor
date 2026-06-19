@@ -8,6 +8,12 @@ auditor reads your `package-lock.json`, queries [OSV.dev](https://osv.dev) for v
 go install github.com/barelyhuman/auditor@latest
 ```
 
+No Go installed? Use [goblin.run](https://goblin.run):
+
+```bash
+curl -sf https://goblin.run/github.com/barelyhuman/auditor | sh
+```
+
 ## The problem with npm audit
 
 `npm audit` is the default security check for Node.js projects, but the workflow it encourages often creates more work than it resolves.
@@ -61,11 +67,25 @@ See [Usage](#usage) below for all flags and options.
 
 ## Install
 
+### Via `go install`
+
 ```bash
 go install github.com/barelyhuman/auditor@latest
 ```
 
-Or build from source:
+### Via [goblin.run](https://goblin.run)
+
+Install a prebuilt binary without Go:
+
+```bash
+# installs to /usr/local/bin/auditor
+curl -sf https://goblin.run/github.com/barelyhuman/auditor | sh
+
+# custom install path
+curl -sf https://goblin.run/github.com/barelyhuman/auditor | PREFIX=./bin sh
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/barelyhuman/auditor
