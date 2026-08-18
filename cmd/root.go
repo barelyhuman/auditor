@@ -28,7 +28,7 @@ var (
 var rootCmd = &cobra.Command{
 	Use:   "auditor [path]",
 	Short: "Audit Node.js dependencies for safe-fixable CVEs",
-	Long: `auditor reads package-lock.json, queries OSV.dev for vulnerabilities,
+	Long: `auditor reads package-lock.json or npm-shrinkwrap.json, queries OSV.dev for vulnerabilities,
 and reports only those fixable without breaking semver changes.`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          run,

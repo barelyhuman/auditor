@@ -8,23 +8,36 @@ import (
 	"strings"
 )
 
+// Find returns the path to npm-shrinkwrap.json (preferred, same as npm) or package-lock.json.
+func Find(dir string) (string, error) {
+	for _, name := range []string{"npm-shrinkwrap.json", "package-lock.json"} {
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no lockfile found (npm-shrinkwrap.json or package-lock.json) — run `npm install` first")
+}
+
 func ReadPackages(dir string) ([]Package, error) {
 	pkgJSON, err := readPackageJSON(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	lockData, err := os.ReadFile(filepath.Join(dir, "package-lock.json"))
+	lockPath, err := Find(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("package-lock.json not found — run `npm install` first")
-		}
-		return nil, fmt.Errorf("read package-lock.json: %w", err)
+		return nil, err
+	}
+
+	lockData, err := os.ReadFile(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", filepath.Base(lockPath), err)
 	}
 
 	var lock PackageLock
 	if err := json.Unmarshal(lockData, &lock); err != nil {
-		return nil, fmt.Errorf("parse package-lock.json: %w", err)
+		return nil, fmt.Errorf("parse %s: %w", filepath.Base(lockPath), err)
 	}
 
 	// Root direct deps (all declared dep sections)

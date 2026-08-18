@@ -174,7 +174,7 @@ Works with npm workspace monorepos. Detects workspace members from the lockfile 
 ## Requirements
 
 - Go 1.23+
-- A `package-lock.json` (npm v7+ format, lockfileVersion 2 or 3)
+- A `package-lock.json` or `npm-shrinkwrap.json` (npm v7+ format, lockfileVersion 2 or 3)
 - Internet access to OSV.dev and registry.npmjs.org
 
 npm does not need to be installed to audit. It is only needed to run `npm install` after patching to update `node_modules`.

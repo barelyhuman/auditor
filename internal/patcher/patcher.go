@@ -22,10 +22,13 @@ type PatchResult struct {
 	Err              error
 }
 
-// PatchPackages updates package-lock.json and all relevant package.json files.
+// PatchPackages updates the lockfile and all relevant package.json files.
 // Uses sjson for surgical in-place writes — preserves key order and formatting.
 func PatchPackages(dir string, vulns []audit.SafeVuln, dryRun bool) ([]PatchResult, error) {
-	lockPath := filepath.Join(dir, "package-lock.json")
+	lockPath, err := lockfile.Find(dir)
+	if err != nil {
+		return nil, err
+	}
 
 	workspaceDirs, _ := lockfile.WorkspaceMemberDirs(lockPath)
 
@@ -110,7 +113,7 @@ func PatchPackages(dir string, vulns []audit.SafeVuln, dryRun bool) ([]PatchResu
 func patchLockfileInPlace(lockPath, pkgName, oldVersion string, dist *registry.DistInfo, dryRun bool) ([]string, error) {
 	data, err := os.ReadFile(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("read package-lock.json: %w", err)
+		return nil, fmt.Errorf("read %s: %w", filepath.Base(lockPath), err)
 	}
 
 	// Partial unmarshal to find matching keys (read-only)
@@ -120,7 +123,7 @@ func patchLockfileInPlace(lockPath, pkgName, oldVersion string, dist *registry.D
 		} `json:"packages"`
 	}
 	if err := json.Unmarshal(data, &lock); err != nil {
-		return nil, fmt.Errorf("parse package-lock.json: %w", err)
+		return nil, fmt.Errorf("parse %s: %w", filepath.Base(lockPath), err)
 	}
 
 	suffix := "node_modules/" + pkgName
@@ -139,7 +142,7 @@ func patchLockfileInPlace(lockPath, pkgName, oldVersion string, dist *registry.D
 
 	if len(patched) > 0 && !dryRun {
 		if err := os.WriteFile(lockPath, data, 0644); err != nil {
-			return nil, fmt.Errorf("write package-lock.json: %w", err)
+			return nil, fmt.Errorf("write %s: %w", filepath.Base(lockPath), err)
 		}
 	}
 	return patched, nil
