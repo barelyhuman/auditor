@@ -62,7 +62,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Reading lockfile from %s...\n", projectDir)
-	packages, err := lockfile.ReadPackages(projectDir)
+	packages, nested, err := lockfile.ReadPackages(projectDir)
 	if err != nil {
 		return err
 	}
@@ -94,7 +94,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Interactive selection
-	selected, err := tui.SelectPackages(vulns)
+	selected, err := tui.SelectPackages(vulns, nested)
 	if err != nil {
 		return fmt.Errorf("selection cancelled: %w", err)
 	}

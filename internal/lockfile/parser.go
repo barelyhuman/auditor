@@ -19,25 +19,25 @@ func Find(dir string) (string, error) {
 	return "", fmt.Errorf("no lockfile found (npm-shrinkwrap.json or package-lock.json) — run `npm install` first")
 }
 
-func ReadPackages(dir string) ([]Package, error) {
+func ReadPackages(dir string) ([]Package, map[string]map[string]bool, error) {
 	pkgJSON, err := readPackageJSON(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	lockPath, err := Find(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	lockData, err := os.ReadFile(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", filepath.Base(lockPath), err)
+		return nil, nil, fmt.Errorf("read %s: %w", filepath.Base(lockPath), err)
 	}
 
 	var lock PackageLock
 	if err := json.Unmarshal(lockData, &lock); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", filepath.Base(lockPath), err)
+		return nil, nil, fmt.Errorf("parse %s: %w", filepath.Base(lockPath), err)
 	}
 
 	// Root direct deps (all declared dep sections)
@@ -83,9 +83,9 @@ func ReadPackages(dir string) ([]Package, error) {
 	}
 
 	if lock.LockfileVersion >= 2 {
-		return parseV2(lock, rootDirect, workspaceDirect), nil
+		return parseV2(lock, rootDirect, workspaceDirect), transitives(lock), nil
 	}
-	return parseV1(lock, rootDirect), nil
+	return parseV1(lock, rootDirect), map[string]map[string]bool{}, nil
 }
 
 func readPackageJSON(dir string) (*PackageJSON, error) {
@@ -175,6 +175,71 @@ func nameFromKey(key string) string {
 		return ""
 	}
 	return key[idx+len(prefix):]
+}
+
+func pkgID(name, version string) string {
+	return name + "|" + version
+}
+
+// transitives maps name|version → descendant name|version in the lockfile tree.
+// ponytail: v1 has no packages map, so this is empty there.
+func transitives(lock PackageLock) map[string]map[string]bool {
+	out := make(map[string]map[string]bool)
+	for key, pkg := range lock.Packages {
+		name := nameFromKey(key)
+		if name == "" {
+			continue
+		}
+		id := pkgID(name, pkg.Version)
+		if out[id] == nil {
+			out[id] = make(map[string]bool)
+		}
+		walkTransitives(lock, key, id, out[id], map[string]bool{key: true})
+	}
+	return out
+}
+
+func walkTransitives(lock PackageLock, fromKey, ancestor string, into map[string]bool, seen map[string]bool) {
+	pkg := lock.Packages[fromKey]
+	for _, deps := range []map[string]string{pkg.Dependencies, pkg.OptionalDependencies} {
+		for name := range deps {
+			childKey := resolveDep(lock.Packages, fromKey, name)
+			if childKey == "" || seen[childKey] {
+				continue
+			}
+			seen[childKey] = true
+			child := lock.Packages[childKey]
+			childID := pkgID(nameFromKey(childKey), child.Version)
+			if childID == ancestor {
+				continue
+			}
+			into[childID] = true
+			walkTransitives(lock, childKey, ancestor, into, seen)
+		}
+	}
+}
+
+// resolveDep walks up from fromKey looking for node_modules/<name>, same as npm.
+func resolveDep(packages map[string]LockedPackage, fromKey, name string) string {
+	prefix := fromKey
+	for {
+		candidate := "node_modules/" + name
+		if prefix != "" {
+			candidate = prefix + "/node_modules/" + name
+		}
+		if _, ok := packages[candidate]; ok {
+			return candidate
+		}
+		if prefix == "" {
+			return ""
+		}
+		i := strings.LastIndex(prefix, "/node_modules/")
+		if i == -1 {
+			prefix = ""
+			continue
+		}
+		prefix = prefix[:i]
+	}
 }
 
 // WorkspaceMemberDirs returns all workspace member paths found in the lockfile packages map.

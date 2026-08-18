@@ -13,7 +13,8 @@ var severityRank = map[string]int{
 }
 
 // SelectPackages shows an interactive multi-select TUI and returns the chosen vulns.
-func SelectPackages(vulns []audit.SafeVuln) ([]audit.SafeVuln, error) {
+// nested is name|version → lockfile descendants; selecting a package hides those for this run.
+func SelectPackages(vulns []audit.SafeVuln, nested map[string]map[string]bool) ([]audit.SafeVuln, error) {
 	if len(vulns) == 0 {
 		return nil, nil
 	}
@@ -29,22 +30,15 @@ func SelectPackages(vulns []audit.SafeVuln) ([]audit.SafeVuln, error) {
 		return sorted[i].PackageName < sorted[j].PackageName
 	})
 
-	opts := make([]huh.Option[string], len(sorted))
-	for i, v := range sorted {
-		cves := ""
-		if len(v.CVEIDs) > 0 {
-			cves = "  " + v.CVEIDs[0]
-		}
-		label := fmt.Sprintf("%-8s  %-30s  %s → %s%s",
-			v.Severity, v.PackageName, v.Version, v.FixedVersion, cves)
-		opts[i] = huh.NewOption(label, v.PackageName+"|"+v.Version)
-	}
-
+	allOpts := optionsFor(sorted, nil, nested)
 	var chosen []string
 	err := huh.NewMultiSelect[string]().
 		Title("Select packages to patch").
-		Description("↑↓ navigate · Space toggle · Enter confirm · Ctrl+C cancel").
-		Options(opts...).
+		Description("↑↓ navigate · Space toggle · Enter confirm · Ctrl+C cancel\nSelecting a package hides its transitives for this run").
+		Options(allOpts...).
+		OptionsFunc(func() []huh.Option[string] {
+			return optionsFor(sorted, chosen, nested)
+		}, &chosen).
 		Value(&chosen).
 		Run()
 
@@ -52,7 +46,7 @@ func SelectPackages(vulns []audit.SafeVuln) ([]audit.SafeVuln, error) {
 		return nil, err
 	}
 
-	// build lookup set
+	chosen = dropNestedIDs(chosen, nested)
 	chosenSet := make(map[string]bool, len(chosen))
 	for _, k := range chosen {
 		chosenSet[k] = true
@@ -65,4 +59,56 @@ func SelectPackages(vulns []audit.SafeVuln) ([]audit.SafeVuln, error) {
 		}
 	}
 	return selected, nil
+}
+
+func optionsFor(sorted []audit.SafeVuln, chosen []string, nested map[string]map[string]bool) []huh.Option[string] {
+	blocked := blockedIDs(chosen, nested)
+	selected := make(map[string]bool, len(chosen))
+	for _, id := range chosen {
+		if !blocked[id] {
+			selected[id] = true
+		}
+	}
+
+	opts := make([]huh.Option[string], 0, len(sorted))
+	seen := make(map[string]bool)
+	for _, v := range sorted {
+		id := v.PackageName + "|" + v.Version
+		if seen[id] || blocked[id] {
+			continue
+		}
+		seen[id] = true
+		cves := ""
+		if len(v.CVEIDs) > 0 {
+			cves = "  " + v.CVEIDs[0]
+		}
+		label := fmt.Sprintf("%-8s  %-30s  %s → %s%s",
+			v.Severity, v.PackageName, v.Version, v.FixedVersion, cves)
+		opts = append(opts, huh.NewOption(label, id).Selected(selected[id]))
+	}
+	if len(opts) == 0 {
+		return optionsFor(sorted, nil, nil) // ponytail: cycle select-all; show full list
+	}
+	return opts
+}
+
+func blockedIDs(selected []string, nested map[string]map[string]bool) map[string]bool {
+	blocked := make(map[string]bool)
+	for _, id := range selected {
+		for child := range nested[id] {
+			blocked[child] = true
+		}
+	}
+	return blocked
+}
+
+func dropNestedIDs(selected []string, nested map[string]map[string]bool) []string {
+	blocked := blockedIDs(selected, nested)
+	out := make([]string, 0, len(selected))
+	for _, id := range selected {
+		if !blocked[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
